@@ -1,45 +1,43 @@
 # shellphone
 
-A Slack ↔ tmux relay for interactive CLI tools (Claude Code, Kiro, etc.).
-Send commands from Slack, get structured updates back in threads, and attach to the session manually at any time.
+Slack ↔ tmux relay for interactive CLI tools.
+Send commands from Slack, get structured updates back in threads, attach to the session anytime.
+
+Built for [Kiro CLI](https://kiro.dev/docs/cli/) and Claude Code — works with anything that supports lifecycle hooks.
 
 ---
 
-## How it works
+## Architecture
 
-Two independent processes communicate only through the filesystem — no shared runtime, no sockets between them.
+Two independent processes.  No shared runtime — only the filesystem.
 
 ```
-Slack  ──►  relay bot  ──► tmux send-keys  ──►  CLI tool  (inside tmux)
+Slack  ──►  relay bot  ──► tmux send-keys  ──►  CLI tool (in tmux)
                                                     │
                                               hook scripts
                                                     │
                                             curl Slack API  ──►  Slack
 ```
 
-**Process 1 — Relay bot** (`shellphone/bot.py`, systemd service)
+**Relay bot** (`shellphone/bot.py`) — Slack Bolt app in Socket Mode.
+Validates senders, queues messages per session, waits for the idle semaphore,
+dispatches via `tmux send-keys`.  Includes a watchdog timer and control commands.
 
-A Slack Bolt app running in Socket Mode.  For each inbound message it:
-1. Validates the sender against `ALLOWED_USERS`
-2. Looks up the tmux session mapped to that Slack channel
-3. Waits for the session semaphore (idle signal)
-4. Delivers the text via `tmux send-keys`
-5. Starts a watchdog timer; if no stop-hook fires within `WATCHDOG_TIMEOUT_MINUTES`, it posts a warning
+**Hook scripts** (`hooks/`) — stateless shell scripts invoked by the CLI tool
+at lifecycle points.  Each one curls Slack directly.  The relay bot never reads
+terminal output.
 
-**Process 2 — CLI tool** (running inside a named tmux session)
+| Script | CLI event | What it does |
+|--------|-----------|-------------|
+| `on-session-start.sh` | *(setup)* | creates Slack channel, writes channel-map, writes semaphore |
+| `on-prompt-submit.sh` | `userPromptSubmit` | removes semaphore, posts prompt as thread parent |
+| `on-tool-use.sh` | `postToolUse` | creates/updates a single "working…" message in the thread |
+| `on-stop.sh` | `stop` | captures pane, posts response, deletes working msg, writes semaphore |
 
-Configured with hook scripts that fire at lifecycle points and `curl` the Slack API directly.  The relay bot never reads terminal output.
+All hooks source `hooks/lib.sh` which provides Slack helpers and resolves
+session state (channel ID, thread-ts, working-ts) from the filesystem.
 
-**Hook scripts** (`hooks/`)
-
-| Hook | Event | Action |
-|------|-------|--------|
-| `on-session-start.sh` | session created | creates Slack channel, writes channel-map entry, writes semaphore |
-| `on-prompt-submit.sh` | prompt submitted | removes semaphore, posts prompt to Slack as thread parent |
-| `on-tool-use.sh` | after each tool call | creates/updates a single "working…" thread message |
-| `on-stop.sh` | turn finished | captures pane, posts response, deletes working message, writes semaphore |
-
-**Shared state** (`~/.shellphone/data/`)
+**Shared state** (`~/.shellphone/data/`):
 
 ```
 ~/.shellphone/
@@ -56,20 +54,20 @@ Configured with hook scripts that fire at lifecycle points and `curl` the Slack 
 
 ## Slack app setup
 
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch**
-2. **Socket Mode** → enable it → create an App-Level Token with `connections:write` → copy the `xapp-…` token
-3. **OAuth & Permissions** → add Bot Token Scopes:
-   - `channels:manage` `channels:read` `chat:write` `groups:write` `im:write`
-4. **Event Subscriptions** → enable → Subscribe to bot events: `message.channels` `message.groups` `app_mention`
-5. **Install to workspace** → copy the `xoxb-…` Bot User OAuth Token
+1. [Create a Slack app](https://api.slack.com/apps) → **From scratch**
+2. **Socket Mode** → enable → create App-Level Token (`connections:write`) → copy `xapp-…`
+3. **OAuth & Permissions** → Bot Token Scopes:
+   `channels:manage` `channels:read` `chat:write` `groups:write`
+4. **Event Subscriptions** → enable → subscribe to: `message.channels` `app_mention`
+5. **Install to workspace** → copy `xoxb-…` Bot Token
 
 ---
 
-## Installation
+## Install
 
 ```bash
-git clone https://github.com/your-org/shellphone
-cd shellphone
+git clone <this-repo> ~/shellphone
+cd ~/shellphone
 bash scripts/install.sh
 ```
 
@@ -78,69 +76,81 @@ Edit `~/.shellphone/.env`:
 ```bash
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
-ALLOWED_USERS=U12345678   # your Slack user ID
+ALLOWED_USERS=U12345678    # your Slack member ID
 ```
 
 ---
 
-## Starting a session
+## Quick start (Kiro CLI)
 
 ```bash
-# Start relay bot (once, as a background service)
+# 1. Start relay bot (once, runs as systemd user service)
 systemctl --user start shellphone
 
-# Create a new session and launch Claude Code inside it
-./scripts/new-session.sh my-project claude
+# 2. Create session and launch Kiro with shellphone hooks
+./scripts/new-session.sh mywork kiro-cli --agent ~/shellphone/examples/kiro-agent.json
 
-# Or Kiro
-./scripts/new-session.sh kiro-work kiro
+# 3. Attach anytime
+tmux attach -t mywork
+
+# 4. Tear down when done
+./scripts/kill-session.sh mywork --archive
 ```
 
-The script creates the tmux session, calls `on-session-start.sh` which
-creates the Slack channel `#shellphone-my-project` and posts a welcome
-message, then starts the CLI tool.
+The `kiro-agent.json` wires Kiro's `userPromptSubmit`, `postToolUse`, and `stop`
+events to the shellphone hook scripts.  `$SHELLPHONE_HOOKS_DIR` is set
+automatically in the tmux environment by `new-session.sh`.
+
+### Kiro agent config
+
+`examples/kiro-agent.json`:
+```json
+{
+  "name": "shellphone",
+  "hooks": {
+    "userPromptSubmit": [{ "command": "$SHELLPHONE_HOOKS_DIR/on-prompt-submit.sh" }],
+    "postToolUse":      [{ "command": "$SHELLPHONE_HOOKS_DIR/on-tool-use.sh" }],
+    "stop":             [{ "command": "$SHELLPHONE_HOOKS_DIR/on-stop.sh" }]
+  }
+}
+```
 
 ---
 
-## Hook configuration (Claude Code)
-
-Copy `examples/claude-code-settings.json` into your project:
+## Quick start (Claude Code)
 
 ```bash
-mkdir -p .claude
-cp /path/to/shellphone/examples/claude-code-settings.json .claude/settings.json
+# 1. Start relay bot
+systemctl --user start shellphone
+
+# 2. Create session
+./scripts/new-session.sh mywork claude
 ```
 
-The `$SHELLPHONE_HOOKS_DIR` variable is set automatically by `new-session.sh`
-in the tmux environment, so hook paths resolve without hardcoding.
-
-For other CLI tools, point their equivalent hook events at the same scripts.
+Add hooks to your project's `.claude/settings.json` — see
+`examples/claude-code-settings.json`.
 
 ---
 
 ## Slack usage
 
-Send messages to the `#shellphone-{session}` channel.  They are queued and
-delivered to the CLI tool in order, waiting for each turn to finish.
+Send messages to `#sp-{session}`.  They queue and deliver in order,
+one per turn, waiting for each stop-hook before sending the next.
 
-**Control commands** (prefix `!`):
+**Control commands** (prefix with `!`):
 
 | Command | Effect |
 |---------|--------|
-| `!help` | show command list |
-| `!status` | session state and queue depth |
-| `!stop` | send Ctrl-C to the session |
-| `!attach` | print the `tmux attach` command |
-| `!clear` | drain the pending message queue |
+| `!help` | list commands |
+| `!status` | session state + queue depth |
+| `!stop` | send Ctrl-C |
+| `!attach` | print the tmux attach command |
+| `!clear` | drain the pending queue |
 
----
-
-## Manual access
-
-Attach to any session at any time — hooks still fire on manual interactions:
+Attach manually at any time — hooks still fire:
 
 ```bash
-tmux attach -t my-project
+tmux attach -t mywork
 ```
 
 ---
@@ -150,18 +160,21 @@ tmux attach -t my-project
 ```
 shellphone/
 ├── shellphone/
-│   └── bot.py              # Slack Bolt relay (Process 1)
+│   └── bot.py              # relay bot
 ├── hooks/
-│   ├── on-session-start.sh # agentSpawn
-│   ├── on-prompt-submit.sh # userPromptSubmit
-│   ├── on-tool-use.sh      # postToolUse
-│   └── on-stop.sh          # stop
+│   ├── lib.sh              # shared helpers (sourced by all hooks)
+│   ├── on-session-start.sh # setup: create channel + map
+│   ├── on-prompt-submit.sh # mark busy, post prompt
+│   ├── on-tool-use.sh      # update working message
+│   └── on-stop.sh          # capture + post response, mark idle
 ├── scripts/
 │   ├── new-session.sh      # create a session
+│   ├── kill-session.sh     # tear down a session
 │   └── install.sh          # one-shot setup
 ├── systemd/
-│   └── shellphone.service  # systemd user unit template
+│   └── shellphone.service  # systemd user unit
 ├── examples/
+│   ├── kiro-agent.json     # Kiro CLI hook config
 │   └── claude-code-settings.json
 ├── requirements.txt
 └── .env.example
@@ -171,6 +184,6 @@ shellphone/
 
 ## Requirements
 
-- Python 3.11+, `pip`
-- `tmux` ≥ 3.0
-- `curl`, `jq`, `flock` (standard on Linux)
+- Python 3.11+
+- `tmux` >= 3.0
+- `curl`, `jq`, `flock`

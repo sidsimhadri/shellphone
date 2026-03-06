@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # scripts/new-session.sh
 #
-# Creates a new shellphone tmux session, registers it with Slack, and
-# optionally launches a CLI tool inside it.
+# Creates a shellphone tmux session, registers it with Slack, and launches
+# a CLI tool inside it.
 #
 # Usage:
 #   new-session.sh <session-name> [command [args...]]
 #
 # Examples:
-#   new-session.sh mywork claude        # start claude CLI
-#   new-session.sh kiro-session kiro    # start kiro CLI
-#   new-session.sh scratch              # bare shell, attach manually
+#   new-session.sh mywork                                    # bare shell
+#   new-session.sh mywork kiro-cli                           # kiro default agent
+#   new-session.sh mywork kiro-cli --agent shellphone        # kiro w/ shellphone agent
+#   new-session.sh mywork claude                             # claude code
 
 set -euo pipefail
 
@@ -24,12 +25,13 @@ if [ -f "$SHELLPHONE_DIR/.env" ]; then
   set -a; source "$SHELLPHONE_DIR/.env"; set +a
 fi
 
-SESSION="${1:?Usage: new-session.sh <session-name> [command]}"
+SESSION="${1:?Usage: new-session.sh <session-name> [command [args...]]}"
 shift || true
-CMD="${*:-}"   # remainder of args is the command; empty = bare shell
+CMD="${*:-}"
 
-# Validate session name (tmux rules: no dot, colon, or leading digit)
-if [[ "$SESSION" =~ [.:]  ]]; then
+# ── Validate ─────────────────────────────────────────────────────────────────
+
+if [[ "$SESSION" =~ [.:] ]]; then
   echo "Error: session name must not contain '.' or ':'" >&2
   exit 1
 fi
@@ -37,14 +39,14 @@ fi
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "Error: tmux session '$SESSION' already exists." >&2
   echo "  Attach:  tmux attach -t $SESSION" >&2
-  echo "  Kill:    tmux kill-session -t $SESSION" >&2
+  echo "  Kill:    $(dirname "$0")/kill-session.sh $SESSION" >&2
   exit 1
 fi
 
-# Ensure data directory exists
+# ── Create tmux session ──────────────────────────────────────────────────────
+
 mkdir -p "$SHELLPHONE_DIR/data/$SESSION"
 
-# Start detached tmux session with shellphone env exported
 tmux new-session -d -s "$SESSION" \
   -e "SHELLPHONE_SESSION=$SESSION" \
   -e "SHELLPHONE_DIR=$SHELLPHONE_DIR" \
@@ -52,17 +54,19 @@ tmux new-session -d -s "$SESSION" \
   -e "SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}" \
   -e "CAPTURE_LINES=${CAPTURE_LINES:-100}"
 
-# Register with Slack (creates channel, writes channel-map, writes semaphore)
+# ── Register with Slack ──────────────────────────────────────────────────────
+
 SHELLPHONE_SESSION="$SESSION" \
 SHELLPHONE_DIR="$SHELLPHONE_DIR" \
   "$HOOKS_DIR/on-session-start.sh"
 
-# Optionally start the CLI tool inside the session
+# ── Launch CLI tool ──────────────────────────────────────────────────────────
+
 if [ -n "$CMD" ]; then
   tmux send-keys -t "$SESSION" "$CMD" Enter
 fi
 
 echo ""
 echo "shellphone: session '$SESSION' is ready."
-echo "  Attach:  tmux attach -t $SESSION"
-echo "  Kill:    tmux kill-session -t $SESSION && rm -rf $SHELLPHONE_DIR/data/$SESSION"
+echo "  Attach:   tmux attach -t $SESSION"
+echo "  Teardown: $(dirname "$0")/kill-session.sh $SESSION [--archive]"

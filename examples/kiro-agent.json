@@ -1,0 +1,21 @@
+{
+  "name": "shellphone",
+  "description": "Default agent with shellphone Slack relay hooks. Sends prompts, tool activity, and responses to the mapped Slack channel.",
+  "hooks": {
+    "userPromptSubmit": [
+      {
+        "command": "$SHELLPHONE_HOOKS_DIR/on-prompt-submit.sh"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "$SHELLPHONE_HOOKS_DIR/on-tool-use.sh"
+      }
+    ],
+    "stop": [
+      {
+        "command": "$SHELLPHONE_HOOKS_DIR/on-stop.sh"
+      }
+    ]
+  }
+}

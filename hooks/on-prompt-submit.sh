@@ -1,46 +1,33 @@
 #!/usr/bin/env bash
-# hooks/on-prompt-submit.sh  — userPromptSubmit equivalent
+# hooks/on-prompt-submit.sh  — userPromptSubmit
 #
-# Called by the CLI tool just before it processes a user prompt.
-# Removes the semaphore (marks session busy), posts the prompt to Slack as
-# a new thread parent, and stores the thread timestamp for subsequent hooks.
+# Fired by the CLI tool when the user submits a prompt.
+# Marks the session busy (removes semaphore), posts the prompt to Slack
+# as a new thread parent, and stores the thread timestamp.
 #
-# Input (stdin): JSON — {"prompt": "..."}   (Claude Code format)
-#                Falls back to raw text if JSON parsing fails.
+# Stdin (Kiro):       {"hook_event_name":"userPromptSubmit","cwd":"...","prompt":"..."}
+# Stdin (Claude Code): {"prompt":"..."}
 #
-# Exit 0 always so the CLI tool proceeds normally.
+# Always exits 0 so the CLI tool proceeds normally.
 
-set -euo pipefail
-
-SESSION="${SHELLPHONE_SESSION:?SHELLPHONE_SESSION not set}"
-SHELLPHONE_DIR="${SHELLPHONE_DIR:-$HOME/.shellphone}"
-DATA_DIR="$SHELLPHONE_DIR/data"
-SESSION_DIR="$DATA_DIR/$SESSION"
-CHANNEL_MAP="$DATA_DIR/channel-map.json"
-
-# --- Read stdin ---
-input=$(cat)
-prompt=$(printf '%s' "$input" | jq -r '.prompt // empty' 2>/dev/null || true)
-[ -z "$prompt" ] && prompt="$input"   # fallback: treat whole stdin as the prompt
-
-# --- Resolve channel ---
-CHANNEL_ID=$(jq -r --arg s "$SESSION" '.[$s] // empty' "$CHANNEL_MAP" 2>/dev/null || true)
+# shellcheck source=lib.sh
+source "$(dirname "$0")/lib.sh"
 [ -z "$CHANNEL_ID" ] && exit 0
 
-# --- Mark session busy (remove semaphore) ---
-rm -f "$SESSION_DIR/semaphore"
+# ── Extract prompt ───────────────────────────────────────────────────────────
 
-# --- Clear previous working-ts (new turn) ---
+prompt=$(printf '%s' "$STDIN_JSON" | jq -r '.prompt // empty' 2>/dev/null || true)
+[ -z "$prompt" ] && prompt="$STDIN_JSON"
+
+# ── Mark session busy ────────────────────────────────────────────────────────
+
+rm -f "$SESSION_DIR/semaphore"
 rm -f "$SESSION_DIR/working-ts"
 
-# --- Post prompt as new thread parent ---
-response=$(curl -sf -X POST https://slack.com/api/chat.postMessage \
-  -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "$(jq -n \
-    --arg channel "$CHANNEL_ID" \
-    --arg prompt "$prompt" \
-    '{channel: $channel, text: (":speech_balloon: *Prompt:*\n> " + $prompt)}')")
+# ── Post prompt as new thread ────────────────────────────────────────────────
+
+response=$(slack_post "$CHANNEL_ID" ":speech_balloon: *Prompt:*
+> $prompt")
 
 thread_ts=$(printf '%s' "$response" | jq -r '.ts // empty')
 [ -n "$thread_ts" ] && printf '%s' "$thread_ts" > "$SESSION_DIR/thread-ts"
