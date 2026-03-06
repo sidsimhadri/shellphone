@@ -56,4 +56,7 @@ fi
 
 touch "$SESSION_DIR/semaphore"
 
+# Signal test harness if running under tmux-test skill
+[ -n "${SHELLPHONE_TEST_SIGNAL:-}" ] && tmux wait-for -S "$SHELLPHONE_TEST_SIGNAL" 2>/dev/null || true
+
 exit 0
