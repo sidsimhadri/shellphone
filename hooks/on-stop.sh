@@ -30,11 +30,11 @@ fi
 raw=$(tmux capture-pane -t "$SESSION" -p -J 2>/dev/null | tail -n "$CAPTURE_LINES" || true)
 clean=$(printf '%s\n' "$raw" | sed '/^[[:space:]]*$/d' | tail -n "$CAPTURE_LINES")
 
-# Slack text limit ~4000 chars
-if [ ${#clean} -gt 3800 ]; then
+# Slack text limit ~4000 chars — trim lines from the top until it fits
+while [ ${#clean} -gt 3800 ] && [ "$(printf '%s' "$clean" | wc -l)" -gt 5 ]; do
   clean="…(truncated)
-$(printf '%s' "$clean" | tail -c 3500)"
-fi
+$(printf '%s' "$clean" | tail -n +3)"
+done
 
 # ── Delete working message ──────────────────────────────────────────────────
 

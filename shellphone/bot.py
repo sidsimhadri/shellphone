@@ -44,20 +44,29 @@ ALLOWED_USERS: list[str] = [
 ]
 WATCHDOG_TIMEOUT_SECS = int(os.getenv("WATCHDOG_TIMEOUT_MINUTES", "10")) * 60
 
+# Validate required tokens early
+for _var in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
+    if not os.environ.get(_var):
+        raise SystemExit(f"shellphone: {_var} is not set.  See ~/.shellphone/.env")
+
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 # ---------------------------------------------------------------------------
-# Per-session state
+# Per-session state (all guarded by _lock)
 # ---------------------------------------------------------------------------
 
 _session_queues: dict[str, queue.Queue] = {}
 _session_threads: dict[str, threading.Thread] = {}
 _watchdog_timers: dict[str, threading.Timer] = {}
-_state_lock = threading.Lock()
+_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Channel-map helpers
 # ---------------------------------------------------------------------------
+
+# Cached reverse map: channel_id → session_name
+_reverse_map: dict[str, str] = {}
+_reverse_map_mtime: float = 0.0
 
 
 def _load_channel_map() -> dict[str, str]:
@@ -69,11 +78,22 @@ def _load_channel_map() -> dict[str, str]:
 
 
 def session_for_channel(channel_id: str) -> str | None:
-    """Return the tmux session name mapped to *channel_id*, or None."""
-    for session, cid in _load_channel_map().items():
-        if cid == channel_id:
-            return session
-    return None
+    """Return the tmux session name mapped to *channel_id*, or None.
+
+    Uses a cached reverse map that refreshes when channel-map.json changes.
+    """
+    global _reverse_map, _reverse_map_mtime
+    try:
+        mtime = CHANNEL_MAP_PATH.stat().st_mtime if CHANNEL_MAP_PATH.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+
+    if mtime != _reverse_map_mtime:
+        cmap = _load_channel_map()
+        _reverse_map = {cid: sess for sess, cid in cmap.items()}
+        _reverse_map_mtime = mtime
+
+    return _reverse_map.get(channel_id)
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +116,7 @@ def _read_file(session: str, name: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Watchdog
+# Watchdog (all access under _lock)
 # ---------------------------------------------------------------------------
 
 
@@ -122,6 +142,7 @@ def _watchdog_fired(session: str, client) -> None:
 
 
 def _start_watchdog(session: str, client) -> None:
+    """Must be called with _lock held."""
     _cancel_watchdog(session)
     t = threading.Timer(WATCHDOG_TIMEOUT_SECS, _watchdog_fired, args=(session, client))
     t.daemon = True
@@ -130,6 +151,7 @@ def _start_watchdog(session: str, client) -> None:
 
 
 def _cancel_watchdog(session: str) -> None:
+    """Safe to call with or without _lock (pop is atomic on dict)."""
     t = _watchdog_timers.pop(session, None)
     if t:
         t.cancel()
@@ -181,26 +203,29 @@ def _dispatch_loop(session: str, q: queue.Queue, client) -> None:
             q.task_done()
             continue
 
-        _start_watchdog(session, client)
+        with _lock:
+            _start_watchdog(session, client)
         q.task_done()
 
 
-def _ensure_dispatch_thread(session: str, client) -> None:
-    with _state_lock:
+def _enqueue(session: str, text: str, client) -> None:
+    """Ensure a dispatch thread exists and enqueue *text* atomically."""
+    with _lock:
         existing = _session_threads.get(session)
-        if existing and existing.is_alive():
-            return
-        q: queue.Queue = queue.Queue()
-        _session_queues[session] = q
-        t = threading.Thread(
-            target=_dispatch_loop,
-            args=(session, q, client),
-            name=f"dispatch-{session}",
-            daemon=True,
-        )
-        t.start()
-        _session_threads[session] = t
-        log.info("Started dispatch thread for session=%s", session)
+        if not existing or not existing.is_alive():
+            q: queue.Queue = queue.Queue()
+            _session_queues[session] = q
+            t = threading.Thread(
+                target=_dispatch_loop,
+                args=(session, q, client),
+                name=f"dispatch-{session}",
+                daemon=True,
+            )
+            t.start()
+            _session_threads[session] = t
+            log.info("Started dispatch thread for session=%s", session)
+        _session_queues[session].put(text)
+    log.info("Queued for session=%s  text=%r", session, text[:60])
 
 
 # ---------------------------------------------------------------------------
@@ -225,8 +250,9 @@ def _handle_control(text: str, session: str, channel: str, client) -> None:
 
     elif cmd == "!status":
         status = "idle :white_check_mark:" if is_idle(session) else "busy :hourglass_flowing_sand:"
-        q = _session_queues.get(session)
-        qsize = q.qsize() if q else 0
+        with _lock:
+            q = _session_queues.get(session)
+            qsize = q.qsize() if q else 0
         client.chat_postMessage(
             channel=channel,
             text=f"*Session `{session}`:* {status} · {qsize} message(s) queued",
@@ -247,15 +273,16 @@ def _handle_control(text: str, session: str, channel: str, client) -> None:
         )
 
     elif cmd == "!clear":
-        q = _session_queues.get(session)
-        cleared = 0
-        if q:
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                    cleared += 1
-                except queue.Empty:
-                    break
+        with _lock:
+            q = _session_queues.get(session)
+            cleared = 0
+            if q:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                        cleared += 1
+                    except queue.Empty:
+                        break
         client.chat_postMessage(
             channel=channel,
             text=f":wastebasket: Cleared {cleared} queued message(s) for `{session}`",
@@ -314,9 +341,7 @@ def _route_message(event: dict, client) -> None:
         return
 
     # Queue for dispatch
-    _ensure_dispatch_thread(session, client)
-    _session_queues[session].put(text)
-    log.info("Queued for session=%s  qsize=%d  text=%r", session, _session_queues[session].qsize(), text[:60])
+    _enqueue(session, text, client)
 
 
 @app.event("message")
