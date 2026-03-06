@@ -31,17 +31,25 @@ CMD="${*:-}"
 
 # ── Validate ─────────────────────────────────────────────────────────────────
 
-if [[ "$SESSION" =~ [.:] ]]; then
-  echo "Error: session name must not contain '.' or ':'" >&2
+if [[ "$SESSION" =~ [.:]  ]]; then
+  echo "shellphone: session name must not contain '.' or ':'" >&2
+  exit 1
+fi
+
+if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+  echo "shellphone: SLACK_BOT_TOKEN not set. Run scripts/install.sh and edit ~/.shellphone/.env" >&2
   exit 1
 fi
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "Error: tmux session '$SESSION' already exists." >&2
+  echo "shellphone: tmux session '$SESSION' already exists." >&2
   echo "  Attach:  tmux attach -t $SESSION" >&2
   echo "  Kill:    $(dirname "$0")/kill-session.sh $SESSION" >&2
   exit 1
 fi
+
+# Clean stale state from a previous session with the same name
+rm -rf "$SHELLPHONE_DIR/data/$SESSION"
 
 # ── Create tmux session ──────────────────────────────────────────────────────
 
@@ -51,14 +59,14 @@ tmux new-session -d -s "$SESSION" \
   -e "SHELLPHONE_SESSION=$SESSION" \
   -e "SHELLPHONE_DIR=$SHELLPHONE_DIR" \
   -e "SHELLPHONE_HOOKS_DIR=$HOOKS_DIR" \
-  -e "SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}" \
+  -e "SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}" \
   -e "CAPTURE_LINES=${CAPTURE_LINES:-100}"
 
 # ── Register with Slack ──────────────────────────────────────────────────────
 
 SHELLPHONE_SESSION="$SESSION" \
 SHELLPHONE_DIR="$SHELLPHONE_DIR" \
-  "$HOOKS_DIR/on-session-start.sh"
+  "$HOOKS_DIR/setup-channel.sh"
 
 # ── Launch CLI tool ──────────────────────────────────────────────────────────
 

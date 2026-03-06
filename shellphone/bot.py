@@ -1,10 +1,13 @@
-"""shellphone — Slack ↔ tmux relay bot.
+"""shellphone relay bot — routes Slack messages to tmux sessions.
 
-Listens for Slack messages in mapped channels and dispatches them to the
-corresponding tmux session via `tmux send-keys`.  All outbound Slack
-notifications (prompts, tool-use updates, final responses) are sent by the
-hook scripts that the CLI tool invokes directly — this process never reads
-terminal output.
+All outbound Slack notifications come from hook scripts that the CLI tool
+invokes directly.  This process only handles inbound: Slack → tmux.
+
+State machine (driven by hooks on the CLI side):
+  IDLE  →  user sends msg  →  bot dispatches via tmux send-keys
+        →  userPromptSubmit hook removes semaphore     →  BUSY
+  BUSY  →  postToolUse hook updates "working…" msg     →  BUSY
+        →  stop hook writes semaphore, posts response  →  IDLE
 """
 
 import json
@@ -27,7 +30,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 # ---------------------------------------------------------------------------
 
 load_dotenv(Path.home() / ".shellphone" / ".env")
-load_dotenv()  # also accept .env in cwd
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +47,6 @@ ALLOWED_USERS: list[str] = [
 ]
 WATCHDOG_TIMEOUT_SECS = int(os.getenv("WATCHDOG_TIMEOUT_MINUTES", "10")) * 60
 
-# Validate required tokens early
 for _var in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
     if not os.environ.get(_var):
         raise SystemExit(f"shellphone: {_var} is not set.  See ~/.shellphone/.env")
@@ -55,21 +57,21 @@ app = App(token=os.environ["SLACK_BOT_TOKEN"])
 # Per-session state (all guarded by _lock)
 # ---------------------------------------------------------------------------
 
-_session_queues: dict[str, queue.Queue] = {}
-_session_threads: dict[str, threading.Thread] = {}
-_watchdog_timers: dict[str, threading.Timer] = {}
+_queues: dict[str, queue.Queue] = {}
+_threads: dict[str, threading.Thread] = {}
+_watchdogs: dict[str, threading.Timer] = {}
 _lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Channel-map helpers
+# Channel map (file-locked, cached with mtime)
 # ---------------------------------------------------------------------------
 
-# Cached reverse map: channel_id → session_name
-_reverse_map: dict[str, str] = {}
-_reverse_map_mtime: float = 0.0
+_chan_to_session: dict[str, str] = {}
+_chan_map_mtime: float = 0.0
 
 
 def _load_channel_map() -> dict[str, str]:
+    """Read channel-map.json under file lock."""
     lock = FileLock(str(CHANNEL_MAP_PATH) + ".lock", timeout=5)
     with lock:
         if CHANNEL_MAP_PATH.exists() and CHANNEL_MAP_PATH.stat().st_size > 0:
@@ -77,27 +79,24 @@ def _load_channel_map() -> dict[str, str]:
     return {}
 
 
-def session_for_channel(channel_id: str) -> str | None:
-    """Return the tmux session name mapped to *channel_id*, or None.
-
-    Uses a cached reverse map that refreshes when channel-map.json changes.
-    """
-    global _reverse_map, _reverse_map_mtime
+def _session_for_channel(channel_id: str) -> str | None:
+    """Resolve channel_id → session name.  Rebuilds cache when file changes."""
+    global _chan_to_session, _chan_map_mtime
     try:
         mtime = CHANNEL_MAP_PATH.stat().st_mtime if CHANNEL_MAP_PATH.exists() else 0.0
     except OSError:
         mtime = 0.0
 
-    if mtime != _reverse_map_mtime:
+    if mtime != _chan_map_mtime:
         cmap = _load_channel_map()
-        _reverse_map = {cid: sess for sess, cid in cmap.items()}
-        _reverse_map_mtime = mtime
+        _chan_to_session = {cid: sess for sess, cid in cmap.items()}
+        _chan_map_mtime = mtime
 
-    return _reverse_map.get(channel_id)
+    return _chan_to_session.get(channel_id)
 
 
 # ---------------------------------------------------------------------------
-# Semaphore / state-file helpers
+# Filesystem state
 # ---------------------------------------------------------------------------
 
 
@@ -105,28 +104,23 @@ def _session_dir(session: str) -> Path:
     return DATA_DIR / session
 
 
-def is_idle(session: str) -> bool:
-    """True when the semaphore file is present (session ready for input)."""
+def _is_idle(session: str) -> bool:
+    """Semaphore present = session is idle and ready for the next prompt."""
     return (_session_dir(session) / "semaphore").exists()
 
 
-def _read_file(session: str, name: str) -> str | None:
-    p = _session_dir(session) / name
-    return p.read_text().strip() if p.exists() else None
-
-
 # ---------------------------------------------------------------------------
-# Watchdog (all access under _lock)
+# Watchdog
 # ---------------------------------------------------------------------------
 
 
 def _watchdog_fired(session: str, client) -> None:
-    log.warning("Watchdog fired for session %s", session)
-    cmap = _load_channel_map()
-    channel = cmap.get(session)
+    log.warning("Watchdog fired for session=%s", session)
+    channel = _load_channel_map().get(session)
     if not channel:
         return
-    thread_ts = _read_file(session, "thread-ts")
+    ts_path = _session_dir(session) / "thread-ts"
+    thread_ts = ts_path.read_text().strip() if ts_path.exists() else None
     try:
         client.chat_postMessage(
             channel=channel,
@@ -138,68 +132,59 @@ def _watchdog_fired(session: str, client) -> None:
             ),
         )
     except Exception as exc:
-        log.error("Watchdog post failed: %s", exc)
+        log.error("Watchdog Slack post failed: %s", exc)
 
 
 def _start_watchdog(session: str, client) -> None:
-    """Must be called with _lock held."""
+    """Start (or restart) the watchdog timer.  Caller must hold _lock."""
     _cancel_watchdog(session)
     t = threading.Timer(WATCHDOG_TIMEOUT_SECS, _watchdog_fired, args=(session, client))
     t.daemon = True
     t.start()
-    _watchdog_timers[session] = t
+    _watchdogs[session] = t
 
 
 def _cancel_watchdog(session: str) -> None:
-    """Safe to call with or without _lock (pop is atomic on dict)."""
-    t = _watchdog_timers.pop(session, None)
+    t = _watchdogs.pop(session, None)
     if t:
         t.cancel()
 
 
 # ---------------------------------------------------------------------------
-# Dispatch loop (one thread per session)
+# Dispatch (one thread per session)
 # ---------------------------------------------------------------------------
 
 
 def _dispatch_loop(session: str, q: queue.Queue, client) -> None:
-    log.info("Dispatch loop started for session=%s", session)
+    log.info("Dispatch thread started for session=%s", session)
     while True:
         text = q.get()
-        log.info("Dispatch: waiting for idle  session=%s  qsize=%d", session, q.qsize())
 
-        # Poll until semaphore appears (session finished previous turn)
-        waited = 0
-        while not is_idle(session):
+        # Wait for the stop hook to write the semaphore before sending
+        while not _is_idle(session):
             time.sleep(0.5)
-            waited += 1
-            if waited % 20 == 0:
-                log.debug("Still waiting for idle on session=%s (%ds)", session, waited // 2)
 
-        log.info("Dispatch: sending to tmux  session=%s  text=%r", session, text[:80])
+        log.info("Sending to tmux session=%s  text=%r", session, text[:80])
         try:
             subprocess.run(
                 ["tmux", "send-keys", "-t", session, "-l", text],
-                check=True,
-                capture_output=True,
+                check=True, capture_output=True,
             )
             subprocess.run(
                 ["tmux", "send-keys", "-t", session, "Enter"],
-                check=True,
-                capture_output=True,
+                check=True, capture_output=True,
             )
         except subprocess.CalledProcessError as exc:
-            log.error("tmux send-keys failed for session=%s: %s", session, exc.stderr.decode())
-            cmap = _load_channel_map()
-            channel = cmap.get(session)
+            log.error("tmux send-keys failed session=%s: %s", session, exc.stderr.decode())
+            channel = _load_channel_map().get(session)
             if channel:
                 try:
                     client.chat_postMessage(
                         channel=channel,
-                        text=f":x: Failed to relay message to `{session}` — is the tmux session still alive?",
+                        text=f":x: Could not relay to `{session}` — is the tmux session alive?",
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.error("Failed to notify Slack: %s", e)
             q.task_done()
             continue
 
@@ -209,23 +194,20 @@ def _dispatch_loop(session: str, q: queue.Queue, client) -> None:
 
 
 def _enqueue(session: str, text: str, client) -> None:
-    """Ensure a dispatch thread exists and enqueue *text* atomically."""
+    """Ensure dispatch thread exists and enqueue text — all under _lock."""
     with _lock:
-        existing = _session_threads.get(session)
-        if not existing or not existing.is_alive():
+        thread = _threads.get(session)
+        if not thread or not thread.is_alive():
             q: queue.Queue = queue.Queue()
-            _session_queues[session] = q
+            _queues[session] = q
             t = threading.Thread(
-                target=_dispatch_loop,
-                args=(session, q, client),
-                name=f"dispatch-{session}",
-                daemon=True,
+                target=_dispatch_loop, args=(session, q, client),
+                name=f"dispatch-{session}", daemon=True,
             )
             t.start()
-            _session_threads[session] = t
+            _threads[session] = t
             log.info("Started dispatch thread for session=%s", session)
-        _session_queues[session].put(text)
-    log.info("Queued for session=%s  text=%r", session, text[:60])
+        _queues[session].put(text)
 
 
 # ---------------------------------------------------------------------------
@@ -233,48 +215,50 @@ def _enqueue(session: str, text: str, client) -> None:
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "*Shellphone control commands:*\n"
-    "`!help` — show this message\n"
-    "`!status` — session status and queue depth\n"
-    "`!stop` — send Ctrl-C to the session\n"
-    "`!attach` — show the tmux attach command\n"
-    "`!clear` — drain the pending message queue"
+    "*shellphone commands:*\n"
+    "`!help` — this message\n"
+    "`!status` — idle/busy + queue depth\n"
+    "`!stop` — send Ctrl-C\n"
+    "`!attach` — show tmux attach command\n"
+    "`!clear` — drain message queue"
 )
 
 
-def _handle_control(text: str, session: str, channel: str, client) -> None:
-    cmd = text.strip().split()[0].lower()
-
+def _handle_control(cmd: str, session: str, channel: str, client) -> None:
     if cmd == "!help":
         client.chat_postMessage(channel=channel, text=HELP_TEXT)
 
     elif cmd == "!status":
-        status = "idle :white_check_mark:" if is_idle(session) else "busy :hourglass_flowing_sand:"
+        idle = _is_idle(session)
         with _lock:
-            q = _session_queues.get(session)
-            qsize = q.qsize() if q else 0
+            q = _queues.get(session)
+            depth = q.qsize() if q else 0
+        status = "idle :white_check_mark:" if idle else "busy :hourglass_flowing_sand:"
         client.chat_postMessage(
             channel=channel,
-            text=f"*Session `{session}`:* {status} · {qsize} message(s) queued",
+            text=f"*`{session}`:* {status} · {depth} queued",
         )
 
     elif cmd == "!stop":
         try:
-            subprocess.run(["tmux", "send-keys", "-t", session, "C-c"], check=True, capture_output=True)
+            subprocess.run(["tmux", "send-keys", "-t", session, "C-c"],
+                           check=True, capture_output=True)
             _cancel_watchdog(session)
-            client.chat_postMessage(channel=channel, text=f":octagonal_sign: Sent Ctrl-C to `{session}`")
-        except subprocess.CalledProcessError as exc:
-            client.chat_postMessage(channel=channel, text=f":x: Could not send Ctrl-C: `{exc}`")
+            client.chat_postMessage(channel=channel,
+                                    text=f":octagonal_sign: Sent Ctrl-C to `{session}`")
+        except subprocess.CalledProcessError:
+            client.chat_postMessage(channel=channel,
+                                    text=f":x: Could not send Ctrl-C to `{session}`")
 
     elif cmd == "!attach":
         client.chat_postMessage(
             channel=channel,
-            text=f"Attach to the session:\n```tmux attach -t {session}```",
+            text=f"```tmux attach -t {session}```",
         )
 
     elif cmd == "!clear":
         with _lock:
-            q = _session_queues.get(session)
+            q = _queues.get(session)
             cleared = 0
             if q:
                 while not q.empty():
@@ -285,63 +269,51 @@ def _handle_control(text: str, session: str, channel: str, client) -> None:
                         break
         client.chat_postMessage(
             channel=channel,
-            text=f":wastebasket: Cleared {cleared} queued message(s) for `{session}`",
+            text=f":wastebasket: Cleared {cleared} queued message(s)",
         )
 
     else:
         client.chat_postMessage(
-            channel=channel,
-            text=f":question: Unknown command `{cmd}`. Try `!help`.",
+            channel=channel, text=f"Unknown command `{cmd}`.  Try `!help`.",
         )
 
 
 # ---------------------------------------------------------------------------
-# Message handler
+# Message routing
 # ---------------------------------------------------------------------------
 
 
 def _route_message(event: dict, client) -> None:
-    """Core routing logic shared by message and app_mention handlers."""
-    # Ignore edits, deletions, and bot-posted messages
     if event.get("subtype") or event.get("bot_id"):
         return
 
-    # Ignore replies inside threads (we only handle top-level messages)
-    ts = event.get("ts", "")
-    thread_ts = event.get("thread_ts")
-    if thread_ts and thread_ts != ts:
+    # Only top-level messages (ts == thread_ts means it's the parent)
+    if event.get("thread_ts") and event.get("thread_ts") != event.get("ts"):
         return
 
-    channel = event.get("channel", "")
-    user = event.get("user", "")
     text = event.get("text", "").strip()
-
     if not text:
         return
 
-    # Strip @-mention prefix (present when app_mention fires)
+    # Strip @-mention prefix from app_mention events
     text = re.sub(r"^<@[A-Z0-9]+>\s*", "", text).strip()
     if not text:
         return
 
-    # Authorization
+    user = event.get("user", "")
     if ALLOWED_USERS and user not in ALLOWED_USERS:
-        log.debug("Ignoring message from unauthorized user=%s", user)
         return
 
-    # Resolve tmux session for this channel
-    session = session_for_channel(channel)
+    channel = event.get("channel", "")
+    session = _session_for_channel(channel)
     if not session:
-        log.debug("No session mapped to channel=%s", channel)
         return
 
-    # Control commands
     if text.startswith("!"):
-        _handle_control(text, session, channel, client)
-        return
-
-    # Queue for dispatch
-    _enqueue(session, text, client)
+        cmd = text.split()[0].lower()
+        _handle_control(cmd, session, channel, client)
+    else:
+        _enqueue(session, text, client)
 
 
 @app.event("message")

@@ -58,7 +58,7 @@ _slack_call() {
   # Prints response JSON.  Logs errors to stderr but does not exit.
   local method="$1" payload="$2"
   local response
-  response=$(curl -sS -X POST "https://slack.com/api/$method" \
+  response=$(curl -sS --max-time 10 -X POST "https://slack.com/api/$method" \
     -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
     -H "Content-Type: application/json" \
     -d "$payload" 2>&1) || {

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# hooks/on-session-start.sh  — agentSpawn
+# hooks/setup-channel.sh
 #
-# Called once by scripts/new-session.sh (before the CLI tool starts).
-# Creates or reuses a Slack channel, registers the session in
-# channel-map.json, writes the idle semaphore, and posts a welcome banner.
+# Called once by scripts/new-session.sh before the CLI tool starts.
+# Creates or reuses a Slack channel, registers the mapping, writes the
+# idle semaphore, and posts a welcome banner.
 #
-# NOT invoked by the CLI tool's hook system — it runs before the tool launches.
+# This is a setup script, not a CLI hook — it runs before the tool launches.
 
 # Source lib (reads stdin, sets SESSION, SESSION_DIR, etc.)
 # shellcheck source=lib.sh
@@ -21,7 +21,7 @@ CHANNEL_NAME="$(printf '%s' "sp-$SESSION" \
 
 # ── Create or resolve channel ────────────────────────────────────────────────
 
-response=$(curl -sf -X POST https://slack.com/api/conversations.create \
+response=$(curl -sf --max-time 10 -X POST https://slack.com/api/conversations.create \
   -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
   -H "Content-Type: application/json" \
   -d "$(jq -n --arg name "$CHANNEL_NAME" '{name: $name}')")
@@ -33,7 +33,7 @@ if [ "$ok" = "true" ]; then
 else
   error=$(printf '%s' "$response" | jq -r '.error')
   if [ "$error" = "name_taken" ]; then
-    CHANNEL_ID=$(curl -sf \
+    CHANNEL_ID=$(curl -sf --max-time 10 \
       "https://slack.com/api/conversations.list?limit=1000&exclude_archived=true" \
       -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
       | jq -r --arg name "$CHANNEL_NAME" '.channels[] | select(.name == $name) | .id')
@@ -64,9 +64,9 @@ touch "$SESSION_DIR/semaphore"
 
 # ── Invite bot to channel (idempotent) ───────────────────────────────────────
 
-BOT_USER_ID=$(curl -sf https://slack.com/api/auth.test \
+BOT_USER_ID=$(curl -sf --max-time 10 https://slack.com/api/auth.test \
   -H "Authorization: Bearer $SLACK_BOT_TOKEN" | jq -r '.user_id')
-curl -sf -X POST https://slack.com/api/conversations.invite \
+curl -sf --max-time 10 -X POST https://slack.com/api/conversations.invite \
   -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
   -H "Content-Type: application/json" \
   -d "$(jq -n --arg channel "$CHANNEL_ID" --arg user "$BOT_USER_ID" \
