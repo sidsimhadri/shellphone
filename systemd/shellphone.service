@@ -1,0 +1,17 @@
+[Unit]
+Description=shellphone — Slack ↔ tmux relay bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={SHELLPHONE_ROOT}
+ExecStart=/usr/bin/python3 -m shellphone.bot
+EnvironmentFile={SHELLPHONE_DIR}/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
